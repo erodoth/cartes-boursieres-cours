@@ -28,6 +28,15 @@ Marché fermé à cette heure pour un ticker donné => on ne le retélécharge p
 du tout : son cours dans cours_actuels reste celui du dernier relevé (dernière
 clôture connue), ce qui correspond à la règle "prix de référence = dernière
 clôture quand le marché est fermé".
+
+Retard Yahoo (ajouté le 2026-10-01) : Yahoo peut avoir jusqu'à 15-20 min de
+retard sur certaines places (licences de données temps réel variables selon
+la bourse). cours_actuels/cours_historique gardent donc DEUX horodatages :
+`horodatage_cours` (l'heure réelle de la bougie renvoyée par Yahoo -- c'est
+la seule à utiliser pour savoir "de quand date ce prix") et
+`horodatage_recuperation` (l'heure à laquelle ce script a tourné -- utile
+seulement pour le suivi/debug du job lui-même). Le run affiche aussi le
+retard médian/max observé à chaque exécution.
 """
 import os
 import sys
@@ -100,7 +109,14 @@ def recuperer_tickers_ouverts(conn, maintenant_utc: datetime):
 
 
 def telecharger_derniers_prix(liste_tickers):
-    """Télécharge par paquets de 100 et retourne {ticker: dernier_prix_close}.
+    """Télécharge par paquets de 100 et retourne {ticker: (prix, horodatage_cours)}
+    où horodatage_cours est l'heure RÉELLE de la bougie Yahoo (UTC) -- PAS
+    l'heure à laquelle ce script tourne. Yahoo peut avoir jusqu'à 15-20 min de
+    retard selon la place (licences de données temps réel variables d'une
+    bourse à l'autre) : sans ça, cours_actuels donnerait l'illusion d'un prix
+    "à l'instant" qui peut en réalité dater d'un bon quart d'heure. On garde
+    les deux horodatages (cf. ecrire_cours) pour que ce retard reste visible
+    plutôt que masqué.
 
     Pas de session requests personnalisée ici : yfinance (via curl_cffi) gère
     lui-même l'impersonation de navigateur nécessaire pour obtenir un "crumb"
@@ -145,7 +161,12 @@ def telecharger_derniers_prix(liste_tickers):
                     else:
                         continue
                     if not serie.empty:
-                        resultats[ticker] = float(serie.iloc[-1])
+                        horodatage_cours = serie.index[-1]
+                        if horodatage_cours.tzinfo is None:
+                            horodatage_cours = horodatage_cours.tz_localize("UTC")
+                        else:
+                            horodatage_cours = horodatage_cours.tz_convert("UTC")
+                        resultats[ticker] = (float(serie.iloc[-1]), horodatage_cours.to_pydatetime())
                 except Exception:
                     continue
 
@@ -155,31 +176,39 @@ def telecharger_derniers_prix(liste_tickers):
     return resultats
 
 
-def ecrire_cours(conn, lignes, horodatage, heure_utc):
-    """lignes: liste de (id_societe, prix, devise)."""
+def ecrire_cours(conn, lignes, horodatage_recuperation, heure_utc):
+    """lignes: liste de (id_societe, prix, devise, horodatage_cours).
+
+    horodatage_cours = heure réelle de la cotation (celle de la bougie Yahoo).
+    horodatage_recuperation = heure à laquelle ce run a tourné. Les deux sont
+    gardés : leur écart, c'est le retard Yahoo observé pour ce ticker.
+    """
     with conn.cursor() as cur:
         psycopg2.extras.execute_values(
             cur,
             """
-            INSERT INTO cours_actuels (id_societe, prix, devise, horodatage, heure_utc, source)
+            INSERT INTO cours_actuels (id_societe, prix, devise, horodatage_cours, horodatage_recuperation, heure_utc, source)
             VALUES %s
             ON CONFLICT (id_societe) DO UPDATE SET
                 prix = EXCLUDED.prix,
                 devise = EXCLUDED.devise,
-                horodatage = EXCLUDED.horodatage,
+                horodatage_cours = EXCLUDED.horodatage_cours,
+                horodatage_recuperation = EXCLUDED.horodatage_recuperation,
                 heure_utc = EXCLUDED.heure_utc,
                 source = EXCLUDED.source
             """,
-            [(id_s, prix, dev, horodatage, heure_utc, "yahoo") for id_s, prix, dev in lignes],
+            [(id_s, prix, dev, h_cours, horodatage_recuperation, heure_utc, "yahoo")
+             for id_s, prix, dev, h_cours in lignes],
         )
         psycopg2.extras.execute_values(
             cur,
             """
-            INSERT INTO cours_historique (id_societe, horodatage, prix, devise, source)
+            INSERT INTO cours_historique (id_societe, horodatage_cours, prix, devise, horodatage_recuperation, source)
             VALUES %s
-            ON CONFLICT (id_societe, horodatage) DO NOTHING
+            ON CONFLICT (id_societe, horodatage_cours) DO NOTHING
             """,
-            [(id_s, horodatage, prix, dev, "yahoo") for id_s, prix, dev in lignes],
+            [(id_s, h_cours, prix, dev, horodatage_recuperation, "yahoo")
+             for id_s, prix, dev, h_cours in lignes],
         )
     conn.commit()
 
@@ -206,11 +235,12 @@ def main():
         lignes = []
         manquants = []
         for ticker, (id_societe, devise) in tickers_ouverts.items():
-            prix = prix_par_ticker.get(ticker)
-            if prix is None:
+            info = prix_par_ticker.get(ticker)
+            if info is None:
                 manquants.append(ticker)
                 continue
-            lignes.append((id_societe, prix, devise))
+            prix, horodatage_cours = info
+            lignes.append((id_societe, prix, devise, horodatage_cours))
 
         if lignes:
             ecrire_cours(conn, lignes, maintenant, maintenant.hour)
@@ -218,6 +248,16 @@ def main():
         print(f"✨ {len(lignes)} cours écrits, {len(manquants)} tickers sans donnée récupérée.")
         if manquants:
             print(f"   Exemples de tickers manquants : {manquants[:20]}")
+
+        if lignes:
+            retards = sorted(
+                ((maintenant - h_cours).total_seconds() / 60, id_s)
+                for id_s, _, _, h_cours in lignes
+            )
+            retard_median = retards[len(retards) // 2][0]
+            retard_max, pire_id = retards[-1]
+            print(f"🕐 Retard Yahoo (run - heure réelle de la cotation) : "
+                  f"médian {retard_median:.1f} min, max {retard_max:.1f} min ({pire_id}).")
     finally:
         conn.close()
 
