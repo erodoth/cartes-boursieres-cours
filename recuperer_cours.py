@@ -32,23 +32,16 @@ clôture quand le marché est fermé".
 import os
 import sys
 import time
-import random
 from datetime import datetime, timezone
 
 import psycopg2
 import psycopg2.extras
 import yfinance as yf
-import requests
 
 TAILLE_PAQUET = 100
 PAUSE_ENTRE_PAQUETS_SEC = 4.0
 HEURE_MAINTENANCE_COMMODITIES = 21  # pause quotidienne CME Globex, 21h-22h UTC
 JOURS_FR = ["lun", "mar", "mer", "jeu", "ven", "sam", "dim"]
-
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-]
 
 
 def jour_ouvre(jours_ouvres: str, jour_semaine_idx: int) -> bool:
@@ -107,27 +100,41 @@ def recuperer_tickers_ouverts(conn, maintenant_utc: datetime):
 
 
 def telecharger_derniers_prix(liste_tickers):
-    """Télécharge par paquets de 100 et retourne {ticker: dernier_prix_close}."""
-    session = requests.Session()
-    session.headers.update({"User-Agent": random.choice(USER_AGENTS)})
+    """Télécharge par paquets de 100 et retourne {ticker: dernier_prix_close}.
 
+    Pas de session requests personnalisée ici : yfinance (via curl_cffi) gère
+    lui-même l'impersonation de navigateur nécessaire pour obtenir un "crumb"
+    Yahoo sans se faire rate-limiter -- lui imposer notre propre session
+    requests écrasait cette gestion et déclenchait du 429 immédiat (constaté
+    le 2026-10-01 depuis un runner GitHub Actions). On retente aussi chaque
+    paquet avec un backoff en cas de 429/vide, les IP partagées des runners
+    étant plus vite bridées qu'une connexion résidentielle.
+    """
     resultats = {}
     paquets = [liste_tickers[i:i + TAILLE_PAQUET] for i in range(0, len(liste_tickers), TAILLE_PAQUET)]
     print(f"📦 {len(liste_tickers)} tickers à jour, {len(paquets)} paquet(s) de {TAILLE_PAQUET} max.")
 
     for i, paquet in enumerate(paquets):
         print(f"  ➔ Paquet {i + 1}/{len(paquets)} ({len(paquet)} tickers)...")
-        try:
-            data = yf.download(
-                paquet, period="1d", interval="5m", progress=False,
-                group_by="ticker", session=session, threads=True,
-            )
-        except Exception as e:
-            print(f"  ❌ Échec paquet {i + 1} : {e}")
-            continue
+        data = None
+        for tentative in range(3):
+            try:
+                data = yf.download(
+                    paquet, period="1d", interval="5m", progress=False,
+                    group_by="ticker", threads=True,
+                )
+            except Exception as e:
+                print(f"  ❌ Tentative {tentative + 1}/3 échouée sur paquet {i + 1} : {e}")
+                data = None
+            if data is not None and not data.empty:
+                break
+            if tentative < 2:
+                pause = 15 * (tentative + 1)
+                print(f"  ⏳ Pas de donnée (429 probable), nouvelle tentative dans {pause}s...")
+                time.sleep(pause)
 
-        if data.empty:
-            print(f"  ⚠️  Paquet {i + 1} : aucune donnée renvoyée.")
+        if data is None or data.empty:
+            print(f"  ⚠️  Paquet {i + 1} : aucune donnée renvoyée après 3 tentatives.")
         else:
             for ticker in paquet:
                 try:
