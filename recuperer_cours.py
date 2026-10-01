@@ -213,6 +213,24 @@ def ecrire_cours(conn, lignes, horodatage_recuperation, heure_utc):
     conn.commit()
 
 
+def ecrire_echecs(conn, manquants, horodatage, heure_utc):
+    """manquants: liste de (id_societe, ticker_yahoo) -- journalise les tickers
+    attendus à cette heure mais pour lesquels Yahoo n'a renvoyé aucune donnée
+    (après les 3 tentatives de telecharger_derniers_prix). Permet, après
+    quelques jours, d'identifier par requête les tickers structurellement
+    problématiques (vs. un simple accident ponctuel de type rate-limit)."""
+    with conn.cursor() as cur:
+        psycopg2.extras.execute_values(
+            cur,
+            """
+            INSERT INTO cours_echecs (id_societe, ticker_yahoo, horodatage, heure_utc)
+            VALUES %s
+            """,
+            [(id_s, ticker, horodatage, heure_utc) for id_s, ticker in manquants],
+        )
+    conn.commit()
+
+
 def main():
     database_url = os.environ.get("DATABASE_URL")
     if not database_url:
@@ -237,17 +255,19 @@ def main():
         for ticker, (id_societe, devise) in tickers_ouverts.items():
             info = prix_par_ticker.get(ticker)
             if info is None:
-                manquants.append(ticker)
+                manquants.append((id_societe, ticker))
                 continue
             prix, horodatage_cours = info
             lignes.append((id_societe, prix, devise, horodatage_cours))
 
         if lignes:
             ecrire_cours(conn, lignes, maintenant, maintenant.hour)
+        if manquants:
+            ecrire_echecs(conn, manquants, maintenant, maintenant.hour)
 
         print(f"✨ {len(lignes)} cours écrits, {len(manquants)} tickers sans donnée récupérée.")
         if manquants:
-            print(f"   Exemples de tickers manquants : {manquants[:20]}")
+            print(f"   Exemples de tickers manquants : {[t for _, t in manquants[:20]]}")
 
         if lignes:
             retards = sorted(
