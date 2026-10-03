@@ -1,3 +1,28 @@
-name: Recuperation des cours
-on: {schedule: [{cron: "5 * * * *"}], workflow_dispatch: {}}
-jobs: {recuperer-cours: {runs-on: ubuntu-latest, timeout-minutes: 20, steps: [{name: Checkout, uses: "actions/checkout@v4"}, {name: Python, uses: "actions/setup-python@v5", with: {python-version: "3.11"}}, {name: Dependances, run: "pip install -r requirements.txt"}, {name: "Recuperation des cours", env: {DATABASE_URL: "${{ secrets.DATABASE_URL }}"}, run: "python recuperer_cours.py"}]}}
+name: Récupération des cours
+
+on:
+  schedule:
+    # Toutes les heures, à :00
+    - cron: "0 * * * *"
+  workflow_dispatch: {}   # permet de lancer le job manuellement depuis l'onglet Actions
+
+jobs:
+  recuperer-cours:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Dépendances
+        run: pip install -r requirements.txt
+
+      - name: Récupération des cours
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python recuperer_cours.py
