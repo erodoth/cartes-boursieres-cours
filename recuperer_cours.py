@@ -108,15 +108,84 @@ def recuperer_tickers_ouverts(conn, maintenant_utc: datetime):
     return tickers
 
 
+def _detail_depuis_exception(e: Exception) -> tuple:
+    """Extrait (code_http, message) d'une exception yfinance/requests, au
+    mieux -- yfinance n'expose pas toujours le code HTTP de façon structurée,
+    donc on retombe sur une détection par mots-clés dans le message quand
+    l'objet exception ne porte pas de `.response.status_code` exploitable."""
+    code_http = None
+    resp = getattr(e, "response", None)
+    if resp is not None:
+        code_http = getattr(resp, "status_code", None)
+    message = str(e) or e.__class__.__name__
+    if code_http is None and ("429" in message or "Too Many Requests" in message):
+        code_http = 429
+    return code_http, message[:500]
+
+
+def _extraire_serie(data, ticker, taille_paquet):
+    """Retourne la série Close non-vide pour `ticker` dans `data` (résultat de
+    yf.download), ou None si absente -- factorisé pour être appelé à la fois
+    sur un paquet et sur un ticker seul (taille_paquet == 1)."""
+    if data is None or data.empty:
+        return None
+    try:
+        if taille_paquet == 1:
+            serie = data["Close"].dropna()
+        elif ticker in data.columns.get_level_values(0):
+            serie = data[ticker]["Close"].dropna()
+        else:
+            return None
+    except Exception:
+        return None
+    return serie if not serie.empty else None
+
+
+def telecharger_un_ticker(ticker):
+    """Repli individuel pour un ticker resté sans donnée après la tentative
+    groupée -- permet de distinguer un ticker réellement cassé (échoue aussi
+    seul, avec une erreur propre à capturer) d'un ticker simplement entraîné
+    dans l'échec d'un paquet à cause d'UN AUTRE ticker du même paquet
+    (constaté le 2026-10-02 sur l'Inde : yf.download() sur un paquet entier
+    abandonne les 100 tickers d'un coup si un seul fait planter la requête
+    groupée, sans jamais les retenter séparément). 2 tentatives avec un
+    backoff court -- on est déjà dans le cas lent/dégradé, pas la peine de
+    s'acharner comme sur un paquet complet.
+
+    Retourne soit (prix, horodatage_cours, None) en cas de succès, soit
+    (None, None, (code_http, detail_erreur)) en cas d'échec.
+    """
+    derniere_erreur = None
+    for tentative in range(2):
+        try:
+            data = yf.download(ticker, period="1d", interval="5m", progress=False)
+        except Exception as e:
+            derniere_erreur = _detail_depuis_exception(e)
+            data = None
+        if data is not None and not data.empty:
+            serie = _extraire_serie(data, ticker, 1)
+            if serie is not None:
+                horodatage_cours = serie.index[-1]
+                if horodatage_cours.tzinfo is None:
+                    horodatage_cours = horodatage_cours.tz_localize("UTC")
+                else:
+                    horodatage_cours = horodatage_cours.tz_convert("UTC")
+                return float(serie.iloc[-1]), horodatage_cours.to_pydatetime(), None
+            derniere_erreur = (None, "requête OK mais aucune cotation renvoyée pour ce ticker")
+        elif derniere_erreur is None:
+            derniere_erreur = (None, "aucune donnée renvoyée (réponse vide)")
+        if tentative == 0:
+            time.sleep(5)
+    return None, None, derniere_erreur
+
+
 def telecharger_derniers_prix(liste_tickers):
-    """Télécharge par paquets de 100 et retourne {ticker: (prix, horodatage_cours)}
-    où horodatage_cours est l'heure RÉELLE de la bougie Yahoo (UTC) -- PAS
-    l'heure à laquelle ce script tourne. Yahoo peut avoir jusqu'à 15-20 min de
-    retard selon la place (licences de données temps réel variables d'une
-    bourse à l'autre) : sans ça, cours_actuels donnerait l'illusion d'un prix
-    "à l'instant" qui peut en réalité dater d'un bon quart d'heure. On garde
-    les deux horodatages (cf. ecrire_cours) pour que ce retard reste visible
-    plutôt que masqué.
+    """Télécharge par paquets de 100 et retourne (resultats, echecs_detail) où
+    resultats = {ticker: (prix, horodatage_cours)} (horodatage_cours = heure
+    RÉELLE de la bougie Yahoo en UTC, PAS l'heure à laquelle ce script tourne
+    -- Yahoo peut avoir jusqu'à 15-20 min de retard selon la place) et
+    echecs_detail = {ticker: (code_http, detail_erreur)} pour tout ticker
+    resté sans prix, même après repli individuel.
 
     Pas de session requests personnalisée ici : yfinance (via curl_cffi) gère
     lui-même l'impersonation de navigateur nécessaire pour obtenir un "crumb"
@@ -125,14 +194,24 @@ def telecharger_derniers_prix(liste_tickers):
     le 2026-10-01 depuis un runner GitHub Actions). On retente aussi chaque
     paquet avec un backoff en cas de 429/vide, les IP partagées des runners
     étant plus vite bridées qu'une connexion résidentielle.
+
+    2026-10-03 : un paquet qui échoue (ou dont il manque certains tickers
+    après coup) ne fait plus abandonner tous ses tickers d'un bloc -- chacun
+    des tickers manquants est retenté individuellement via
+    telecharger_un_ticker avant d'être compté comme un vrai échec, ce qui
+    isole le ou les tickers réellement cassés du reste du paquet (cf. cas de
+    l'Inde, où un seul ticker en faute semblait faire tomber les 52 d'un
+    coup, toutes les heures).
     """
     resultats = {}
+    echecs_detail = {}
     paquets = [liste_tickers[i:i + TAILLE_PAQUET] for i in range(0, len(liste_tickers), TAILLE_PAQUET)]
     print(f"📦 {len(liste_tickers)} tickers à jour, {len(paquets)} paquet(s) de {TAILLE_PAQUET} max.")
 
     for i, paquet in enumerate(paquets):
         print(f"  ➔ Paquet {i + 1}/{len(paquets)} ({len(paquet)} tickers)...")
         data = None
+        derniere_erreur_paquet = None
         for tentative in range(3):
             try:
                 data = yf.download(
@@ -140,6 +219,7 @@ def telecharger_derniers_prix(liste_tickers):
                     group_by="ticker", threads=True,
                 )
             except Exception as e:
+                derniere_erreur_paquet = _detail_depuis_exception(e)
                 print(f"  ❌ Tentative {tentative + 1}/3 échouée sur paquet {i + 1} : {e}")
                 data = None
             if data is not None and not data.empty:
@@ -149,31 +229,38 @@ def telecharger_derniers_prix(liste_tickers):
                 print(f"  ⏳ Pas de donnée (429 probable), nouvelle tentative dans {pause}s...")
                 time.sleep(pause)
 
+        manquants_paquet = []
         if data is None or data.empty:
-            print(f"  ⚠️  Paquet {i + 1} : aucune donnée renvoyée après 3 tentatives.")
+            print(f"  ⚠️  Paquet {i + 1} : aucune donnée renvoyée après 3 tentatives -- repli individuel.")
+            manquants_paquet = list(paquet)
         else:
             for ticker in paquet:
-                try:
-                    if len(paquet) == 1:
-                        serie = data["Close"].dropna()
-                    elif ticker in data.columns.get_level_values(0):
-                        serie = data[ticker]["Close"].dropna()
+                serie = _extraire_serie(data, ticker, len(paquet))
+                if serie is not None:
+                    horodatage_cours = serie.index[-1]
+                    if horodatage_cours.tzinfo is None:
+                        horodatage_cours = horodatage_cours.tz_localize("UTC")
                     else:
-                        continue
-                    if not serie.empty:
-                        horodatage_cours = serie.index[-1]
-                        if horodatage_cours.tzinfo is None:
-                            horodatage_cours = horodatage_cours.tz_localize("UTC")
-                        else:
-                            horodatage_cours = horodatage_cours.tz_convert("UTC")
-                        resultats[ticker] = (float(serie.iloc[-1]), horodatage_cours.to_pydatetime())
-                except Exception:
-                    continue
+                        horodatage_cours = horodatage_cours.tz_convert("UTC")
+                    resultats[ticker] = (float(serie.iloc[-1]), horodatage_cours.to_pydatetime())
+                else:
+                    manquants_paquet.append(ticker)
+
+        if manquants_paquet:
+            print(f"  🔁 {len(manquants_paquet)} ticker(s) du paquet {i + 1} sans donnée -- repli individuel...")
+            for ticker in manquants_paquet:
+                prix, horodatage_cours, erreur = telecharger_un_ticker(ticker)
+                if prix is not None:
+                    resultats[ticker] = (prix, horodatage_cours)
+                    print(f"     ✅ {ticker} récupéré individuellement (le paquet l'avait perdu).")
+                else:
+                    echecs_detail[ticker] = erreur or derniere_erreur_paquet or (None, "échec sans détail")
+                time.sleep(1)
 
         if i + 1 < len(paquets):
             time.sleep(PAUSE_ENTRE_PAQUETS_SEC)
 
-    return resultats
+    return resultats, echecs_detail
 
 
 def ecrire_cours(conn, lignes, horodatage_recuperation, heure_utc):
@@ -214,19 +301,21 @@ def ecrire_cours(conn, lignes, horodatage_recuperation, heure_utc):
 
 
 def ecrire_echecs(conn, manquants, horodatage, heure_utc):
-    """manquants: liste de (id_societe, ticker_yahoo) -- journalise les tickers
-    attendus à cette heure mais pour lesquels Yahoo n'a renvoyé aucune donnée
-    (après les 3 tentatives de telecharger_derniers_prix). Permet, après
-    quelques jours, d'identifier par requête les tickers structurellement
-    problématiques (vs. un simple accident ponctuel de type rate-limit)."""
+    """manquants: liste de (id_societe, ticker_yahoo, code_http, detail_erreur)
+    -- journalise les tickers attendus à cette heure mais pour lesquels Yahoo
+    n'a renvoyé aucune donnée, même après repli individuel
+    (telecharger_derniers_prix). code_http/detail_erreur (ajoutés le
+    2026-10-03) permettent enfin de distinguer un rate-limit (429) d'un
+    ticker structurellement cassé, sans avoir à rejouer le job pour deviner."""
     with conn.cursor() as cur:
         psycopg2.extras.execute_values(
             cur,
             """
-            INSERT INTO cours_echecs (id_societe, ticker_yahoo, horodatage, heure_utc)
+            INSERT INTO cours_echecs (id_societe, ticker_yahoo, horodatage, heure_utc, code_http, detail_erreur)
             VALUES %s
             """,
-            [(id_s, ticker, horodatage, heure_utc) for id_s, ticker in manquants],
+            [(id_s, ticker, horodatage, heure_utc, code_http, detail_erreur)
+             for id_s, ticker, code_http, detail_erreur in manquants],
         )
     conn.commit()
 
@@ -248,14 +337,15 @@ def main():
             print("⚠️  Aucun ticker ouvert à cette heure -- rien à faire.")
             return
 
-        prix_par_ticker = telecharger_derniers_prix(list(tickers_ouverts.keys()))
+        prix_par_ticker, echecs_detail = telecharger_derniers_prix(list(tickers_ouverts.keys()))
 
         lignes = []
         manquants = []
         for ticker, (id_societe, devise) in tickers_ouverts.items():
             info = prix_par_ticker.get(ticker)
             if info is None:
-                manquants.append((id_societe, ticker))
+                code_http, detail_erreur = echecs_detail.get(ticker, (None, "échec sans détail"))
+                manquants.append((id_societe, ticker, code_http, detail_erreur))
                 continue
             prix, horodatage_cours = info
             lignes.append((id_societe, prix, devise, horodatage_cours))
@@ -265,9 +355,9 @@ def main():
         if manquants:
             ecrire_echecs(conn, manquants, maintenant, maintenant.hour)
 
-        print(f"✨ {len(lignes)} cours écrits, {len(manquants)} tickers sans donnée récupérée.")
+        print(f"✨ {len(lignes)} cours écrits, {len(manquants)} tickers sans donnée récupérée (après repli individuel).")
         if manquants:
-            print(f"   Exemples de tickers manquants : {[t for _, t in manquants[:20]]}")
+            print(f"   Exemples de tickers manquants : {[(t, c, d) for _, t, c, d in manquants[:20]]}")
 
         if lignes:
             retards = sorted(
