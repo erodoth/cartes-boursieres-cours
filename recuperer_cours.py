@@ -41,7 +41,7 @@ retard médian/max observé à chaque exécution.
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import psycopg2
@@ -126,11 +126,18 @@ def journaliser(conn, heure_ref, demarre_le, nb_attendus, nb_ecrits, nb_echecs, 
 
 
 def recuperer_tickers_ouverts(conn, maintenant_utc: datetime):
-    """Retourne {ticker_yahoo: (id_societe, devise)} pour tout ce qui doit être
-    coté à l'heure UTC courante."""
+    """Retourne ({ticker_yahoo: (id_societe, devise)}, {tickers de clôture}).
+
+    Le dictionnaire contient tout ce qui doit être coté à l'heure UTC courante, PLUS (2026-10-06) les tickers dont le
+    marché vient de fermer (ouvert à l'heure précédente, plus ouvert maintenant) : ce chargement « de clôture » capte
+    le dernier cours de la séance, que les chargements pendant la séance ne voient pas (le dernier tombe à :11 de la
+    dernière heure ouverte, soit 35 à 50 min avant la fermeture). Le 2e élément du tuple liste ces tickers de clôture."""
     heure = maintenant_utc.hour
     jour_idx = maintenant_utc.weekday()  # 0 = lundi
+    precedente = maintenant_utc - timedelta(hours=1)
+    heure_prec, jour_prec = precedente.hour, precedente.weekday()
     tickers = {}
+    cloture = set()
 
     with conn.cursor() as cur:
         # Sociétés cotées (hors "collector"), place ouverte à cette heure/jour
@@ -146,24 +153,35 @@ def recuperer_tickers_ouverts(conn, maintenant_utc: datetime):
         )
         for id_societe, ticker_yahoo, devise, heures_csv, jours_ouvres in cur.fetchall():
             heures_ouvertes = {int(h) for h in (heures_csv or "").split(",") if h.strip() != ""}
-            if heure in heures_ouvertes and jour_ouvre(jours_ouvres, jour_idx):
+            ouvert_maintenant = heure in heures_ouvertes and jour_ouvre(jours_ouvres, jour_idx)
+            vient_de_fermer = (
+                not ouvert_maintenant and heure_prec in heures_ouvertes and jour_ouvre(jours_ouvres, jour_prec)
+            )
+            if ouvert_maintenant:
                 tickers[ticker_yahoo] = (id_societe, devise)
+            elif vient_de_fermer:
+                tickers[ticker_yahoo] = (id_societe, devise)
+                cloture.add(ticker_yahoo)
 
-        # Commodities : toutes les heures sauf maintenance CME Globex (21h UTC),
-        # fermé le samedi (jour_idx == 5)
-        if heure != HEURE_MAINTENANCE_COMMODITIES and jour_idx != 5:
+        # Commodities : toutes les heures sauf maintenance CME Globex (21h UTC) et le samedi (jour_idx == 5).
+        # À 21h (maintenance) on les charge quand même UNE fois si l'heure précédente était ouverte : c'est leur clôture.
+        commodites_ouvertes = heure != HEURE_MAINTENANCE_COMMODITIES and jour_idx != 5
+        commodites_cloture = heure == HEURE_MAINTENANCE_COMMODITIES and jour_prec != 5
+        if commodites_ouvertes or commodites_cloture:
             cur.execute(
                 "SELECT id_societe, ticker_yahoo FROM commodites WHERE ticker_yahoo IS NOT NULL"
             )
             for id_societe, ticker_yahoo in cur.fetchall():
                 tickers[ticker_yahoo] = (id_societe, "USD")
+                if commodites_cloture:
+                    cloture.add(ticker_yahoo)
 
         # Cryptos : 24/7
         cur.execute("SELECT id_societe, ticker_yahoo FROM cryptos WHERE ticker_yahoo IS NOT NULL")
         for id_societe, ticker_yahoo in cur.fetchall():
             tickers[ticker_yahoo] = (id_societe, "USD")
 
-    return tickers
+    return tickers, cloture
 
 
 def _detail_depuis_exception(e: Exception) -> tuple:
@@ -444,7 +462,7 @@ def main():
         if deja_complet(conn, heure_ref):
             print("✅ Chargement déjà complet pour cette heure -- rien à faire (passage de rattrapage).")
             return
-        tickers_ouverts = recuperer_tickers_ouverts(conn, maintenant)
+        tickers_ouverts, tickers_cloture = recuperer_tickers_ouverts(conn, maintenant)
         if not tickers_ouverts:
             print("⚠️  Aucun ticker ouvert à cette heure -- rien à faire.")
             journaliser(conn, heure_ref, maintenant, 0, 0, 0, 0, True, "aucun ticker ouvert")
@@ -464,7 +482,9 @@ def main():
                 return
     finally:
         conn.close()
-    print(f"ℹ️  {len(tickers_ouverts)} tickers attendus, dont {len(chroniques & set(tickers_ouverts))} en échec chronique.")
+    print(f"ℹ️  {len(tickers_ouverts)} tickers attendus, dont {len(tickers_cloture & set(tickers_ouverts))} de clôture"
+          f" et {len(chroniques & set(tickers_ouverts))} en échec chronique.")
+    nb_cloture = len(tickers_cloture & set(tickers_ouverts))
 
     nb_ecrits = 0
 
@@ -509,7 +529,12 @@ def main():
         journaliser(
             conn, heure_ref, maintenant, len(tickers_ouverts), nb_ecrits, len(manquants) - len(non_traites),
             len(non_traites), complet,
-            None if complet else f"incomplet : budget de {BUDGET_SEC // 60} min dépassé",
+            " ; ".join(
+                x for x in (
+                    f"dont {nb_cloture} ticker(s) de clôture" if nb_cloture else "",
+                    "" if complet else f"incomplet : budget de {BUDGET_SEC // 60} min dépassé",
+                ) if x
+            ) or None,
         )
     finally:
         conn.close()
