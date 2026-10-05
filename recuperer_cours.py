@@ -53,6 +53,12 @@ PAUSE_ENTRE_PAQUETS_SEC = 4.0
 HEURE_MAINTENANCE_COMMODITIES = 21  # pause quotidienne CME Globex, 21h-22h UTC
 JOURS_FR = ["lun", "mar", "mer", "jeu", "ven", "sam", "dim"]
 
+# 2026-10-05 -- fiabilisation (des heures entières étaient perdues : le run téléchargeait TOUT puis n'écrivait
+# qu'à la fin, donc un run arrêté par la limite de 30 min de GitHub n'écrivait rien).
+BUDGET_SEC = 22 * 60            # au-delà, on arrête de télécharger et on écrit ce qu'on a (limite GitHub : 40 min)
+MAX_REPLIS_INDIVIDUELS = 60     # plafond de repli un par un par run (chacun coûte 5 à 12 s)
+SEUIL_CHRONIQUE = 6             # >= 6 échecs sur 24 h ET aucun cours depuis 5 jours => ticker « chronique »
+
 
 def jour_ouvre(jours_ouvres: str, jour_semaine_idx: int) -> bool:
     """jours_ouvres: 'lun-ven' ou 'dim-jeu'. jour_semaine_idx: 0=lundi .. 6=dimanche
@@ -66,6 +72,57 @@ def jour_ouvre(jours_ouvres: str, jour_semaine_idx: int) -> bool:
     # plage qui traverse la semaine (ex. 'ven-lun'), pas utilisé actuellement
     # mais gardé par robustesse
     return jour_semaine_idx >= i_debut or jour_semaine_idx <= i_fin
+
+
+def ouvrir_connexion(database_url):
+    """Connexion Postgres courte durée (keepalive actif). On n'en garde JAMAIS une ouverte pendant les
+    téléchargements Yahoo (plusieurs minutes d'inactivité) : le pooleur peut la couper."""
+    return psycopg2.connect(
+        database_url, keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=5, connect_timeout=20,
+    )
+
+
+def deja_complet(conn, heure_ref: datetime) -> bool:
+    """Vrai si un chargement COMPLET existe déjà pour cette heure (le 2e passage de rattrapage s'arrête alors)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM journal_chargements_cours WHERE heure_utc = %s AND complet LIMIT 1", (heure_ref,)
+        )
+        return cur.fetchone() is not None
+
+
+def tickers_chroniques(conn) -> set:
+    """Tickers en échec permanent : >= SEUIL_CHRONIQUE échecs sur 24 h et aucun cours depuis 5 jours.
+    Ils restent dans le téléchargement groupé (gratuit s'ils répondent) mais n'ont plus de repli individuel."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT e.ticker_yahoo
+            FROM cours_echecs e
+            WHERE e.horodatage >= now() - interval '24 hours'
+            GROUP BY e.id_societe, e.ticker_yahoo
+            HAVING count(*) >= %s
+               AND NOT EXISTS (
+                   SELECT 1 FROM cours_historique h
+                   WHERE h.id_societe = e.id_societe AND h.horodatage_recuperation >= now() - interval '5 days'
+               )
+            """,
+            (SEUIL_CHRONIQUE,),
+        )
+        return {r[0] for r in cur.fetchall()}
+
+
+def journaliser(conn, heure_ref, demarre_le, nb_attendus, nb_ecrits, nb_echecs, nb_non_traites, complet, remarque=None):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO journal_chargements_cours
+                (heure_utc, demarre_le, nb_attendus, nb_ecrits, nb_echecs, nb_non_traites, complet, remarque)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (heure_ref, demarre_le, nb_attendus, nb_ecrits, nb_echecs, nb_non_traites, complet, remarque),
+        )
+    conn.commit()
 
 
 def recuperer_tickers_ouverts(conn, maintenant_utc: datetime):
@@ -195,8 +252,8 @@ def telecharger_un_ticker(ticker):
     return None, None, derniere_erreur
 
 
-def telecharger_derniers_prix(liste_tickers):
-    """Télécharge par paquets de 100 et retourne (resultats, echecs_detail) où
+def telecharger_derniers_prix(liste_tickers, deadline=None, chroniques=frozenset(), ecrire_lot=None):
+    """Télécharge par paquets de 100 et retourne (resultats, echecs_detail, non_traites) où
     resultats = {ticker: (prix, horodatage_cours)} (horodatage_cours = heure
     RÉELLE de la bougie Yahoo en UTC, PAS l'heure à laquelle ce script tourne
     -- Yahoo peut avoir jusqu'à 15-20 min de retard selon la place) et
@@ -221,11 +278,20 @@ def telecharger_derniers_prix(liste_tickers):
     """
     resultats = {}
     echecs_detail = {}
+    non_traites = []   # tickers laissés de côté faute de temps
+    nb_replis = 0
     paquets = [liste_tickers[i:i + TAILLE_PAQUET] for i in range(0, len(liste_tickers), TAILLE_PAQUET)]
     print(f"📦 {len(liste_tickers)} tickers à jour, {len(paquets)} paquet(s) de {TAILLE_PAQUET} max.")
 
     for i, paquet in enumerate(paquets):
+        if deadline is not None and time.monotonic() > deadline:
+            # Budget de temps épuisé : on n'attaque pas ce paquet ni les suivants, le run écrit ce qu'il a.
+            for reste in paquets[i:]:
+                non_traites.extend(reste)
+            print(f"  ⏱️  Budget de temps dépassé : {len(non_traites)} ticker(s) non traités (paquets {i + 1} à {len(paquets)}).")
+            break
         print(f"  ➔ Paquet {i + 1}/{len(paquets)} ({len(paquet)} tickers)...")
+        lot = {}
         data = None
         derniere_erreur_paquet = None
         for tentative in range(3):
@@ -259,7 +325,7 @@ def telecharger_derniers_prix(liste_tickers):
                             horodatage_cours = horodatage_cours.tz_localize("UTC")
                         else:
                             horodatage_cours = horodatage_cours.tz_convert("UTC")
-                        resultats[ticker] = (float(serie.iloc[-1]), horodatage_cours.to_pydatetime())
+                        resultats[ticker] = lot[ticker] = (float(serie.iloc[-1]), horodatage_cours.to_pydatetime())
                     else:
                         manquants_paquet.append(ticker)
                 except Exception:
@@ -268,21 +334,39 @@ def telecharger_derniers_prix(liste_tickers):
         if manquants_paquet:
             print(f"  🔁 {len(manquants_paquet)} ticker(s) du paquet {i + 1} sans donnée -- repli individuel...")
             for ticker in manquants_paquet:
+                # Pas de repli individuel pour les tickers chroniques, au-delà du plafond, ni hors budget de temps.
+                if ticker in chroniques:
+                    echecs_detail[ticker] = (None, "ticker en échec chronique : repli individuel ignoré")
+                    continue
+                if nb_replis >= MAX_REPLIS_INDIVIDUELS or (deadline is not None and time.monotonic() > deadline):
+                    echecs_detail[ticker] = (None, "repli individuel ignoré (plafond ou budget de temps du run)")
+                    continue
+                nb_replis += 1
                 try:
                     prix, horodatage_cours, erreur = telecharger_un_ticker(ticker)
                 except Exception as e:  # filet de sécurité : un ticker ne fait jamais tomber le run
                     prix, horodatage_cours, erreur = None, None, (None, f"erreur inattendue : {type(e).__name__}: {e}"[:500])
                 if prix is not None:
-                    resultats[ticker] = (prix, horodatage_cours)
+                    resultats[ticker] = lot[ticker] = (prix, horodatage_cours)
                     print(f"     ✅ {ticker} récupéré individuellement (le paquet l'avait perdu).")
                 else:
                     echecs_detail[ticker] = erreur or derniere_erreur_paquet or (None, "échec sans détail")
                 time.sleep(1)
 
+        # Écriture IMMÉDIATE du paquet : un arrêt du run (limite de temps, panne) ne fait plus perdre l'heure entière.
+        if lot and ecrire_lot is not None:
+            try:
+                ecrire_lot(lot)
+            except Exception as e:  # une écriture ratée ne doit pas arrêter les autres paquets
+                print(f"  ❌ Écriture du paquet {i + 1} échouée : {type(e).__name__}: {e}")
+                for t in lot:
+                    resultats.pop(t, None)
+                    echecs_detail[t] = (None, f"écriture en base échouée : {type(e).__name__}"[:500])
+
         if i + 1 < len(paquets):
             time.sleep(PAUSE_ENTRE_PAQUETS_SEC)
 
-    return resultats, echecs_detail
+    return resultats, echecs_detail, non_traites
 
 
 def ecrire_cours(conn, lignes, horodatage_recuperation, heure_utc):
@@ -348,50 +432,102 @@ def main():
         print("❌ Variable d'environnement DATABASE_URL manquante.")
         sys.exit(1)
 
+    debut = time.monotonic()
+    deadline = debut + BUDGET_SEC
     maintenant = datetime.now(timezone.utc)
+    heure_ref = maintenant.replace(minute=0, second=0, microsecond=0)
     print(f"⚡ Run {maintenant.isoformat()} (heure UTC {maintenant.hour}, jour {JOURS_FR[maintenant.weekday()]})")
 
-    conn = psycopg2.connect(database_url)
+    # Connexion courte : lecture de la liste des tickers, puis fermée avant les téléchargements.
+    conn = ouvrir_connexion(database_url)
     try:
+        if deja_complet(conn, heure_ref):
+            print("✅ Chargement déjà complet pour cette heure -- rien à faire (passage de rattrapage).")
+            return
         tickers_ouverts = recuperer_tickers_ouverts(conn, maintenant)
-
         if not tickers_ouverts:
             print("⚠️  Aucun ticker ouvert à cette heure -- rien à faire.")
+            journaliser(conn, heure_ref, maintenant, 0, 0, 0, 0, True, "aucun ticker ouvert")
             return
-
-        prix_par_ticker, echecs_detail = telecharger_derniers_prix(list(tickers_ouverts.keys()))
-
-        lignes = []
-        manquants = []
-        for ticker, (id_societe, devise) in tickers_ouverts.items():
-            info = prix_par_ticker.get(ticker)
-            if info is None:
-                code_http, detail_erreur = echecs_detail.get(ticker, (None, "échec sans détail"))
-                manquants.append((id_societe, ticker, code_http, detail_erreur))
-                continue
-            prix, horodatage_cours = info
-            lignes.append((id_societe, prix, devise, horodatage_cours))
-
-        if lignes:
-            ecrire_cours(conn, lignes, maintenant, maintenant.hour)
-        if manquants:
-            ecrire_echecs(conn, manquants, maintenant, maintenant.hour)
-
-        print(f"✨ {len(lignes)} cours écrits, {len(manquants)} tickers sans donnée récupérée (après repli individuel).")
-        if manquants:
-            print(f"   Exemples de tickers manquants : {[(t, c, d) for _, t, c, d in manquants[:20]]}")
-
-        if lignes:
-            retards = sorted(
-                ((maintenant - h_cours).total_seconds() / 60, id_s)
-                for id_s, _, _, h_cours in lignes
-            )
-            retard_median = retards[len(retards) // 2][0]
-            retard_max, pire_id = retards[-1]
-            print(f"🕐 Retard Yahoo (run - heure réelle de la cotation) : "
-                  f"médian {retard_median:.1f} min, max {retard_max:.1f} min ({pire_id}).")
+        chroniques = tickers_chroniques(conn)
+        # Passage de rattrapage après un run incomplet : on ne retélécharge pas ce qui est déjà écrit pour cette heure
+        # (sinon le rattrapage refait les mêmes premiers paquets et n'atteint jamais la fin de la liste).
+        with conn.cursor() as cur:
+            cur.execute("SELECT id_societe FROM cours_actuels WHERE horodatage_recuperation >= %s", (heure_ref,))
+            deja_ecrits = {r[0] for r in cur.fetchall()}
+        if deja_ecrits:
+            avant = len(tickers_ouverts)
+            tickers_ouverts = {t: v for t, v in tickers_ouverts.items() if v[0] not in deja_ecrits}
+            print(f"↩️  Rattrapage : {avant - len(tickers_ouverts)} ticker(s) déjà écrits pour cette heure, {len(tickers_ouverts)} restant(s).")
+            if not tickers_ouverts:
+                journaliser(conn, heure_ref, maintenant, 0, 0, 0, 0, True, "rattrapage : tout était déjà écrit")
+                return
     finally:
         conn.close()
+    print(f"ℹ️  {len(tickers_ouverts)} tickers attendus, dont {len(chroniques & set(tickers_ouverts))} en échec chronique.")
+
+    nb_ecrits = 0
+
+    def ecrire_lot(lot):
+        """Écrit les cours d'un paquet avec une connexion neuve (2 tentatives)."""
+        nonlocal nb_ecrits
+        lignes_lot = [(tickers_ouverts[t][0], prix, tickers_ouverts[t][1], h_cours) for t, (prix, h_cours) in lot.items()]
+        for tentative in range(2):
+            try:
+                c = ouvrir_connexion(database_url)
+                try:
+                    ecrire_cours(c, lignes_lot, maintenant, maintenant.hour)
+                finally:
+                    c.close()
+                nb_ecrits += len(lignes_lot)
+                return
+            except Exception:
+                if tentative == 1:
+                    raise
+                time.sleep(3)
+
+    prix_par_ticker, echecs_detail, non_traites = telecharger_derniers_prix(
+        list(tickers_ouverts.keys()), deadline=deadline, chroniques=chroniques, ecrire_lot=ecrire_lot,
+    )
+
+    manquants = []
+    ensemble_non_traites = set(non_traites)
+    for ticker, (id_societe, devise) in tickers_ouverts.items():
+        if ticker in prix_par_ticker:
+            continue
+        if ticker in ensemble_non_traites:
+            manquants.append((id_societe, ticker, None, "non téléchargé : budget de temps du run dépassé"))
+            continue
+        code_http, detail_erreur = echecs_detail.get(ticker, (None, "échec sans détail"))
+        manquants.append((id_societe, ticker, code_http, detail_erreur))
+
+    complet = not non_traites
+    conn = ouvrir_connexion(database_url)
+    try:
+        if manquants:
+            ecrire_echecs(conn, manquants, maintenant, maintenant.hour)
+        journaliser(
+            conn, heure_ref, maintenant, len(tickers_ouverts), nb_ecrits, len(manquants) - len(non_traites),
+            len(non_traites), complet,
+            None if complet else f"incomplet : budget de {BUDGET_SEC // 60} min dépassé",
+        )
+    finally:
+        conn.close()
+
+    print(f"✨ {nb_ecrits} cours écrits, {len(manquants)} tickers sans donnée récupérée"
+          f" ({len(non_traites)} non traités faute de temps). Durée {time.monotonic() - debut:.0f}s.")
+    if manquants:
+        print(f"   Exemples de tickers manquants : {[(t, c, d) for _, t, c, d in manquants[:20]]}")
+
+    if prix_par_ticker:
+        retards = sorted(
+            ((maintenant - h_cours).total_seconds() / 60, tickers_ouverts[t][0])
+            for t, (_, h_cours) in prix_par_ticker.items()
+        )
+        retard_median = retards[len(retards) // 2][0]
+        retard_max, pire_id = retards[-1]
+        print(f"🕐 Retard Yahoo (run - heure réelle de la cotation) : "
+              f"médian {retard_median:.1f} min, max {retard_max:.1f} min ({pire_id}).")
 
 
 if __name__ == "__main__":
