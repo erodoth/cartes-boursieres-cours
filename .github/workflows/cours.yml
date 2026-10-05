@@ -2,8 +2,11 @@ name: Récupération des cours
 
 on:
   schedule:
-    # Toutes les heures, à :00
-    - cron: "0 * * * *"
+    # Deux passages par heure, à des minutes « creuses » (GitHub retarde ou saute les tâches lancées à :00).
+    # Le 2e passage est un RATTRAPAGE : il s'arrête tout de suite si le chargement de l'heure est déjà complet
+    # (journal_chargements_cours) et sinon ne traite que ce qui manque.
+    - cron: "11 * * * *"
+    - cron: "41 * * * *"
   workflow_dispatch: {}   # permet de lancer le job manuellement depuis l'onglet Actions
 
 # Un seul run à la fois : si un run dépasse l'heure, le suivant attend au lieu de se chevaucher.
@@ -14,7 +17,7 @@ concurrency:
 jobs:
   recuperer-cours:
     runs-on: ubuntu-24.04      # version fixée (ubuntu-latest passe à Ubuntu 26 le 19/10/2026)
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - name: Checkout
         uses: actions/checkout@v5
