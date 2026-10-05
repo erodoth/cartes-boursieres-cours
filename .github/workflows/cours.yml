@@ -6,16 +6,21 @@ on:
     - cron: "0 * * * *"
   workflow_dispatch: {}   # permet de lancer le job manuellement depuis l'onglet Actions
 
+# Un seul run à la fois : si un run dépasse l'heure, le suivant attend au lieu de se chevaucher.
+concurrency:
+  group: recuperer-cours
+  cancel-in-progress: false
+
 jobs:
   recuperer-cours:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    runs-on: ubuntu-24.04      # version fixée (ubuntu-latest passe à Ubuntu 26 le 19/10/2026)
+    timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
