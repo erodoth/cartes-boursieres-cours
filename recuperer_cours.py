@@ -43,6 +43,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
+import pandas as pd
 import psycopg2
 import psycopg2.extras
 import yfinance as yf
@@ -131,11 +132,20 @@ def _extraire_serie(data, ticker, taille_paquet):
         return None
     try:
         if taille_paquet == 1:
-            serie = data["Close"].dropna()
+            serie = data["Close"]
         elif ticker in data.columns.get_level_values(0):
-            serie = data[ticker]["Close"].dropna()
+            serie = data[ticker]["Close"]
         else:
             return None
+        # yfinance >= 0.2.51 renvoie des colonnes MultiIndex même pour UN seul ticker : data["Close"]
+        # est alors un DataFrame (une colonne par ticker) et non une Series -- float(serie.iloc[-1])
+        # plantait en TypeError ("float() argument must be ... not 'Series'"), ce qui faisait tomber
+        # tout le run (constaté le 2026-10-05, repli individuel de l'étape paquet 6/36).
+        if isinstance(serie, pd.DataFrame):
+            if serie.shape[1] == 0:
+                return None
+            serie = serie.iloc[:, 0]
+        serie = serie.dropna()
     except Exception:
         return None
     return serie if not serie.empty else None
@@ -163,15 +173,21 @@ def telecharger_un_ticker(ticker):
             derniere_erreur = _detail_depuis_exception(e)
             data = None
         if data is not None and not data.empty:
-            serie = _extraire_serie(data, ticker, 1)
-            if serie is not None:
-                horodatage_cours = serie.index[-1]
-                if horodatage_cours.tzinfo is None:
-                    horodatage_cours = horodatage_cours.tz_localize("UTC")
-                else:
-                    horodatage_cours = horodatage_cours.tz_convert("UTC")
-                return float(serie.iloc[-1]), horodatage_cours.to_pydatetime(), None
-            derniere_erreur = (None, "requête OK mais aucune cotation renvoyée pour ce ticker")
+            try:
+                serie = _extraire_serie(data, ticker, 1)
+                if serie is not None:
+                    horodatage_cours = serie.index[-1]
+                    if horodatage_cours.tzinfo is None:
+                        horodatage_cours = horodatage_cours.tz_localize("UTC")
+                    else:
+                        horodatage_cours = horodatage_cours.tz_convert("UTC")
+                    return float(serie.iloc[-1]), horodatage_cours.to_pydatetime(), None
+            except Exception as e:
+                # Un ticker au format de réponse inattendu ne doit JAMAIS faire tomber tout le run :
+                # on le compte comme un échec (journalisé dans cours_echecs) et on continue.
+                derniere_erreur = (None, f"réponse illisible : {type(e).__name__}: {e}"[:500])
+            else:
+                derniere_erreur = (None, "requête OK mais aucune cotation renvoyée pour ce ticker")
         elif derniere_erreur is None:
             derniere_erreur = (None, "aucune donnée renvoyée (réponse vide)")
         if tentative == 0:
@@ -235,21 +251,27 @@ def telecharger_derniers_prix(liste_tickers):
             manquants_paquet = list(paquet)
         else:
             for ticker in paquet:
-                serie = _extraire_serie(data, ticker, len(paquet))
-                if serie is not None:
-                    horodatage_cours = serie.index[-1]
-                    if horodatage_cours.tzinfo is None:
-                        horodatage_cours = horodatage_cours.tz_localize("UTC")
+                try:
+                    serie = _extraire_serie(data, ticker, len(paquet))
+                    if serie is not None:
+                        horodatage_cours = serie.index[-1]
+                        if horodatage_cours.tzinfo is None:
+                            horodatage_cours = horodatage_cours.tz_localize("UTC")
+                        else:
+                            horodatage_cours = horodatage_cours.tz_convert("UTC")
+                        resultats[ticker] = (float(serie.iloc[-1]), horodatage_cours.to_pydatetime())
                     else:
-                        horodatage_cours = horodatage_cours.tz_convert("UTC")
-                    resultats[ticker] = (float(serie.iloc[-1]), horodatage_cours.to_pydatetime())
-                else:
+                        manquants_paquet.append(ticker)
+                except Exception:
                     manquants_paquet.append(ticker)
 
         if manquants_paquet:
             print(f"  🔁 {len(manquants_paquet)} ticker(s) du paquet {i + 1} sans donnée -- repli individuel...")
             for ticker in manquants_paquet:
-                prix, horodatage_cours, erreur = telecharger_un_ticker(ticker)
+                try:
+                    prix, horodatage_cours, erreur = telecharger_un_ticker(ticker)
+                except Exception as e:  # filet de sécurité : un ticker ne fait jamais tomber le run
+                    prix, horodatage_cours, erreur = None, None, (None, f"erreur inattendue : {type(e).__name__}: {e}"[:500])
                 if prix is not None:
                     resultats[ticker] = (prix, horodatage_cours)
                     print(f"     ✅ {ticker} récupéré individuellement (le paquet l'avait perdu).")
