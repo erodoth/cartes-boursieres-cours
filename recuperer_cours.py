@@ -204,17 +204,17 @@ def _detail_depuis_exception(e: Exception) -> tuple:
     return code_http, message[:500]
 
 
-def _extraire_serie(data, ticker, taille_paquet):
-    """Retourne la série Close non-vide pour `ticker` dans `data` (résultat de
+def _extraire_serie(data, ticker, taille_paquet, colonne="Close"):
+    """Retourne la série `colonne` (Close par défaut) non-vide pour `ticker` dans `data` (résultat de
     yf.download), ou None si absente -- factorisé pour être appelé à la fois
     sur un paquet et sur un ticker seul (taille_paquet == 1)."""
     if data is None or data.empty:
         return None
     try:
         if taille_paquet == 1:
-            serie = data["Close"]
+            serie = data[colonne]
         elif ticker in data.columns.get_level_values(0):
-            serie = data[ticker]["Close"]
+            serie = data[ticker][colonne]
         else:
             return None
         # yfinance >= 0.2.51 renvoie des colonnes MultiIndex même pour UN seul ticker : data["Close"]
@@ -229,6 +229,28 @@ def _extraire_serie(data, ticker, taille_paquet):
     except Exception:
         return None
     return serie if not serie.empty else None
+
+
+# 2026-10-06 : cours d'OUVERTURE de la séance (première bougie du jour), par ticker, pour le run en cours.
+# Renseigné par telecharger_derniers_prix / telecharger_un_ticker, lu par ecrire_lot. Absent pour les tickers « sans
+# transaction » (pas de bougie du jour). Sert à calculer la variation horaire depuis l'ouverture (cf. calculer_variations_heure).
+OUVERTURES = {}
+
+
+def _memoriser_ouverture(data, ticker, taille_paquet):
+    """Enregistre dans OUVERTURES le prix d'ouverture et l'heure (UTC) de la première bougie du jour de `ticker`.
+    Ne lève jamais d'exception : sans ouverture lisible, on garde simplement l'ancien comportement."""
+    try:
+        serie = _extraire_serie(data, ticker, taille_paquet, "Open")
+        if serie is None:
+            return
+        h = serie.index[0]
+        h = h.tz_localize("UTC") if h.tzinfo is None else h.tz_convert("UTC")
+        prix = float(serie.iloc[0])
+        if prix > 0:
+            OUVERTURES[ticker] = (prix, h.to_pydatetime())
+    except Exception:
+        return
 
 
 def telecharger_un_ticker(ticker):
@@ -261,6 +283,7 @@ def telecharger_un_ticker(ticker):
                         horodatage_cours = horodatage_cours.tz_localize("UTC")
                     else:
                         horodatage_cours = horodatage_cours.tz_convert("UTC")
+                    _memoriser_ouverture(data, ticker, 1)
                     return float(serie.iloc[-1]), horodatage_cours.to_pydatetime(), None
             except Exception as e:
                 # Un ticker au format de réponse inattendu ne doit JAMAIS faire tomber tout le run :
@@ -386,6 +409,7 @@ def telecharger_derniers_prix(liste_tickers, deadline=None, chroniques=frozenset
                         else:
                             horodatage_cours = horodatage_cours.tz_convert("UTC")
                         resultats[ticker] = lot[ticker] = (float(serie.iloc[-1]), horodatage_cours.to_pydatetime())
+                        _memoriser_ouverture(data, ticker, len(paquet))
                     else:
                         manquants_paquet.append(ticker)
                 except Exception:
@@ -454,7 +478,8 @@ def telecharger_derniers_prix(liste_tickers, deadline=None, chroniques=frozenset
 
 
 def ecrire_cours(conn, lignes, horodatage_recuperation, heure_utc):
-    """lignes: liste de (id_societe, prix, devise, horodatage_cours).
+    """lignes: liste de (id_societe, prix, devise, horodatage_cours, prix_ouverture, horodatage_ouverture)
+    (les deux derniers peuvent être None : ticker sans bougie du jour).
 
     horodatage_cours = heure réelle de la cotation (celle de la bougie Yahoo).
     horodatage_recuperation = heure à laquelle ce run a tourné. Les deux sont
@@ -464,9 +489,12 @@ def ecrire_cours(conn, lignes, horodatage_recuperation, heure_utc):
         psycopg2.extras.execute_values(
             cur,
             """
-            INSERT INTO cours_actuels (id_societe, prix, devise, horodatage_cours, horodatage_recuperation, heure_utc, source)
+            INSERT INTO cours_actuels (id_societe, prix, devise, horodatage_cours, horodatage_recuperation, heure_utc, source,
+                                       prix_ouverture, horodatage_ouverture)
             VALUES %s
             ON CONFLICT (id_societe) DO UPDATE SET
+                prix_ouverture = EXCLUDED.prix_ouverture,
+                horodatage_ouverture = EXCLUDED.horodatage_ouverture,
                 prix = EXCLUDED.prix,
                 devise = EXCLUDED.devise,
                 horodatage_cours = EXCLUDED.horodatage_cours,
@@ -474,18 +502,19 @@ def ecrire_cours(conn, lignes, horodatage_recuperation, heure_utc):
                 heure_utc = EXCLUDED.heure_utc,
                 source = EXCLUDED.source
             """,
-            [(id_s, prix, dev, h_cours, horodatage_recuperation, heure_utc, "yahoo")
-             for id_s, prix, dev, h_cours in lignes],
+            [(id_s, prix, dev, h_cours, horodatage_recuperation, heure_utc, "yahoo", p_ouv, h_ouv)
+             for id_s, prix, dev, h_cours, p_ouv, h_ouv in lignes],
         )
         psycopg2.extras.execute_values(
             cur,
             """
-            INSERT INTO cours_historique (id_societe, horodatage_cours, prix, devise, horodatage_recuperation, source)
+            INSERT INTO cours_historique (id_societe, horodatage_cours, prix, devise, horodatage_recuperation, source,
+                                          prix_ouverture, horodatage_ouverture)
             VALUES %s
             ON CONFLICT (id_societe, horodatage_cours) DO NOTHING
             """,
-            [(id_s, h_cours, prix, dev, horodatage_recuperation, "yahoo")
-             for id_s, prix, dev, h_cours in lignes],
+            [(id_s, h_cours, prix, dev, horodatage_recuperation, "yahoo", p_ouv, h_ouv)
+             for id_s, prix, dev, h_cours, p_ouv, h_ouv in lignes],
         )
     conn.commit()
 
@@ -557,7 +586,11 @@ def main():
     def ecrire_lot(lot):
         """Écrit les cours d'un paquet avec une connexion neuve (2 tentatives)."""
         nonlocal nb_ecrits
-        lignes_lot = [(tickers_ouverts[t][0], prix, tickers_ouverts[t][1], h_cours) for t, (prix, h_cours) in lot.items()]
+        lignes_lot = [
+            (tickers_ouverts[t][0], prix, tickers_ouverts[t][1], h_cours,
+             *OUVERTURES.get(t, (None, None)))
+            for t, (prix, h_cours) in lot.items()
+        ]
         for tentative in range(2):
             try:
                 c = ouvrir_connexion(database_url)
