@@ -60,7 +60,7 @@ JOURS_FR = ["lun", "mar", "mer", "jeu", "ven", "sam", "dim"]
 
 # 2026-10-05 -- fiabilisation (des heures entières étaient perdues : le run téléchargeait TOUT puis n'écrivait
 # qu'à la fin, donc un run arrêté par la limite de 30 min de GitHub n'écrivait rien).
-BUDGET_SEC = 22 * 60            # au-delà, on arrête de télécharger et on écrit ce qu'on a (limite GitHub : 40 min)
+BUDGET_SEC = 15 * 60            # lancé à :40 : au-delà de 15 min (:55) on arrête de télécharger et on écrit ce qu'on a, avant le calcul des scores de :00
 MAX_REPLIS_INDIVIDUELS = 60     # plafond de repli un par un par run (chacun coûte 5 à 12 s)
 SEUIL_CHRONIQUE = 6             # >= 6 échecs sur 24 h ET aucun cours depuis 5 jours => ticker « chronique »
 
