@@ -29,6 +29,11 @@ du tout : son cours dans cours_actuels reste celui du dernier relevé (dernière
 clôture connue), ce qui correspond à la règle "prix de référence = dernière
 clôture quand le marché est fermé".
 
+« Sans transaction » (ajouté le 2026-10-06) : une valeur peu liquide qui n'a pas échangé aujourd'hui n'a aucun chandelier
+de 5 minutes pour period="1d" (Yahoo répond « vide ») alors qu'elle a bien un cours. Ces tickers sont désormais retrouvés par
+un téléchargement groupé sur 5 jours, comptés comme réussis (« dont N ticker(s) sans transaction aujourd'hui » dans le
+journal) et non plus comme échecs ni retentés un par un.
+
 Retard Yahoo (ajouté le 2026-10-01) : Yahoo peut avoir jusqu'à 15-20 min de
 retard sur certaines places (licences de données temps réel variables selon
 la bourse). cours_actuels/cours_historique gardent donc DEUX horodatages :
@@ -270,13 +275,45 @@ def telecharger_un_ticker(ticker):
     return None, None, derniere_erreur
 
 
+def telecharger_sans_transaction(tickers):
+    """2026-10-06 : pour des tickers sans AUCUN chandelier aujourd'hui (valeur peu liquide qui n'a pas échangé :
+    Yahoo répond « vide » pour period="1d" alors que le titre a bien un cours, celui de sa dernière transaction),
+    récupère la dernière cotation connue sur 5 jours en UN téléchargement groupé.
+
+    Retourne {ticker: (prix, horodatage_cours)} pour ceux qui ont une cotation récente ; les autres (aucune donnée
+    sur 5 jours) restent de vrais échecs et passent au repli individuel."""
+    trouves = {}
+    if not tickers:
+        return trouves
+    try:
+        data = yf.download(tickers, period="5d", interval="5m", progress=False, group_by="ticker", threads=True)
+    except Exception as e:
+        print(f"  ⚠️  Recherche de la dernière cotation sur 5 jours échouée : {type(e).__name__}: {e}")
+        return trouves
+    for ticker in tickers:
+        try:
+            serie = _extraire_serie(data, ticker, len(tickers))
+            if serie is None:
+                continue
+            horodatage_cours = serie.index[-1]
+            if horodatage_cours.tzinfo is None:
+                horodatage_cours = horodatage_cours.tz_localize("UTC")
+            else:
+                horodatage_cours = horodatage_cours.tz_convert("UTC")
+            trouves[ticker] = (float(serie.iloc[-1]), horodatage_cours.to_pydatetime())
+        except Exception:
+            continue
+    return trouves
+
+
 def telecharger_derniers_prix(liste_tickers, deadline=None, chroniques=frozenset(), ecrire_lot=None):
-    """Télécharge par paquets de 100 et retourne (resultats, echecs_detail, non_traites) où
+    """Télécharge par paquets de 100 et retourne (resultats, echecs_detail, non_traites, sans_transaction) où
     resultats = {ticker: (prix, horodatage_cours)} (horodatage_cours = heure
     RÉELLE de la bougie Yahoo en UTC, PAS l'heure à laquelle ce script tourne
-    -- Yahoo peut avoir jusqu'à 15-20 min de retard selon la place) et
+    -- Yahoo peut avoir jusqu'à 15-20 min de retard selon la place),
     echecs_detail = {ticker: (code_http, detail_erreur)} pour tout ticker
-    resté sans prix, même après repli individuel.
+    resté sans prix, même après repli individuel, et sans_transaction = ensemble des tickers qui ont un cours
+    mais n'ont pas échangé aujourd'hui (cours ancien, compté comme réussite et non comme échec).
 
     Pas de session requests personnalisée ici : yfinance (via curl_cffi) gère
     lui-même l'impersonation de navigateur nécessaire pour obtenir un "crumb"
@@ -297,6 +334,7 @@ def telecharger_derniers_prix(liste_tickers, deadline=None, chroniques=frozenset
     resultats = {}
     echecs_detail = {}
     non_traites = []   # tickers laissés de côté faute de temps
+    sans_transaction = set()
     nb_replis = 0
     paquets = [liste_tickers[i:i + TAILLE_PAQUET] for i in range(0, len(liste_tickers), TAILLE_PAQUET)]
     print(f"📦 {len(liste_tickers)} tickers à jour, {len(paquets)} paquet(s) de {TAILLE_PAQUET} max.")
@@ -349,6 +387,18 @@ def telecharger_derniers_prix(liste_tickers, deadline=None, chroniques=frozenset
                 except Exception:
                     manquants_paquet.append(ticker)
 
+        # Paquet bien reçu mais certains tickers sans chandelier du jour : ce sont en général des valeurs qui n'ont pas
+        # échangé aujourd'hui (pas une panne). On cherche leur dernière cotation sur 5 jours AVANT tout repli individuel.
+        # Si le paquet entier est vide (429 probable), on ne tente rien de tel : c'est une vraie panne, repli habituel.
+        if manquants_paquet and data is not None and not data.empty and (deadline is None or time.monotonic() <= deadline):
+            trouves = telecharger_sans_transaction(manquants_paquet)
+            for ticker, valeur in trouves.items():
+                resultats[ticker] = lot[ticker] = valeur
+                sans_transaction.add(ticker)
+            if trouves:
+                print(f"  💤 {len(trouves)} ticker(s) du paquet {i + 1} sans transaction aujourd'hui (dernier cours conservé).")
+            manquants_paquet = [t for t in manquants_paquet if t not in trouves]
+
         if manquants_paquet:
             print(f"  🔁 {len(manquants_paquet)} ticker(s) du paquet {i + 1} sans donnée -- repli individuel...")
             for ticker in manquants_paquet:
@@ -379,12 +429,13 @@ def telecharger_derniers_prix(liste_tickers, deadline=None, chroniques=frozenset
                 print(f"  ❌ Écriture du paquet {i + 1} échouée : {type(e).__name__}: {e}")
                 for t in lot:
                     resultats.pop(t, None)
+                    sans_transaction.discard(t)
                     echecs_detail[t] = (None, f"écriture en base échouée : {type(e).__name__}"[:500])
 
         if i + 1 < len(paquets):
             time.sleep(PAUSE_ENTRE_PAQUETS_SEC)
 
-    return resultats, echecs_detail, non_traites
+    return resultats, echecs_detail, non_traites, sans_transaction
 
 
 def ecrire_cours(conn, lignes, horodatage_recuperation, heure_utc):
@@ -506,9 +557,10 @@ def main():
                     raise
                 time.sleep(3)
 
-    prix_par_ticker, echecs_detail, non_traites = telecharger_derniers_prix(
+    prix_par_ticker, echecs_detail, non_traites, sans_transaction = telecharger_derniers_prix(
         list(tickers_ouverts.keys()), deadline=deadline, chroniques=chroniques, ecrire_lot=ecrire_lot,
     )
+    nb_sans_transaction = len(sans_transaction)
 
     manquants = []
     ensemble_non_traites = set(non_traites)
@@ -532,6 +584,7 @@ def main():
             " ; ".join(
                 x for x in (
                     f"dont {nb_cloture} ticker(s) de clôture" if nb_cloture else "",
+                    f"dont {nb_sans_transaction} ticker(s) sans transaction aujourd'hui" if nb_sans_transaction else "",
                     "" if complet else f"incomplet : budget de {BUDGET_SEC // 60} min dépassé",
                 ) if x
             ) or None,
@@ -539,15 +592,18 @@ def main():
     finally:
         conn.close()
 
-    print(f"✨ {nb_ecrits} cours écrits, {len(manquants)} tickers sans donnée récupérée"
+    print(f"✨ {nb_ecrits} cours écrits (dont {nb_sans_transaction} sans transaction aujourd'hui), "
+          f"{len(manquants)} tickers sans donnée récupérée"
           f" ({len(non_traites)} non traités faute de temps). Durée {time.monotonic() - debut:.0f}s.")
     if manquants:
         print(f"   Exemples de tickers manquants : {[(t, c, d) for _, t, c, d in manquants[:20]]}")
 
-    if prix_par_ticker:
+    # Les tickers « sans transaction » ont un cours vieux de plusieurs heures ou jours : on les écarte des statistiques de retard.
+    prix_recents = {t: v for t, v in prix_par_ticker.items() if t not in sans_transaction}
+    if prix_recents:
         retards = sorted(
             ((maintenant - h_cours).total_seconds() / 60, tickers_ouverts[t][0])
-            for t, (_, h_cours) in prix_par_ticker.items()
+            for t, (_, h_cours) in prix_recents.items()
         )
         retard_median = retards[len(retards) // 2][0]
         retard_max, pire_id = retards[-1]
