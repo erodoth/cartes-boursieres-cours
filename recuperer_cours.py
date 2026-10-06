@@ -275,20 +275,24 @@ def telecharger_un_ticker(ticker):
     return None, None, derniere_erreur
 
 
-def telecharger_sans_transaction(tickers):
+def telecharger_sans_transaction(tickers, period="5d", interval="5m"):
     """2026-10-06 : pour des tickers sans AUCUN chandelier aujourd'hui (valeur peu liquide qui n'a pas échangé :
     Yahoo répond « vide » pour period="1d" alors que le titre a bien un cours, celui de sa dernière transaction),
-    récupère la dernière cotation connue sur 5 jours en UN téléchargement groupé.
+    récupère la dernière cotation connue sur `period` en UN téléchargement groupé.
 
-    Retourne {ticker: (prix, horodatage_cours)} pour ceux qui ont une cotation récente ; les autres (aucune donnée
-    sur 5 jours) restent de vrais échecs et passent au repli individuel."""
+    Deux niveaux sont utilisés par telecharger_derniers_prix : 5 jours en bougies de 5 min, puis (pour les valeurs
+    qui n'ont pas échangé depuis plus d'une semaine, ex. petites valeurs d'Euronext Growth) 3 mois en bougies
+    journalières -- le cours renvoyé est alors la dernière clôture connue, avec sa vraie date.
+
+    Retourne {ticker: (prix, horodatage_cours)} pour ceux qui ont une cotation sur la période ; les autres restent
+    de vrais échecs et passent au repli individuel."""
     trouves = {}
     if not tickers:
         return trouves
     try:
-        data = yf.download(tickers, period="5d", interval="5m", progress=False, group_by="ticker", threads=True)
+        data = yf.download(tickers, period=period, interval=interval, progress=False, group_by="ticker", threads=True)
     except Exception as e:
-        print(f"  ⚠️  Recherche de la dernière cotation sur 5 jours échouée : {type(e).__name__}: {e}")
+        print(f"  ⚠️  Recherche de la dernière cotation ({period}) échouée : {type(e).__name__}: {e}")
         return trouves
     for ticker in tickers:
         try:
@@ -398,6 +402,17 @@ def telecharger_derniers_prix(liste_tickers, deadline=None, chroniques=frozenset
             if trouves:
                 print(f"  💤 {len(trouves)} ticker(s) du paquet {i + 1} sans transaction aujourd'hui (dernier cours conservé).")
             manquants_paquet = [t for t in manquants_paquet if t not in trouves]
+
+            # 2e niveau : valeurs qui n'ont pas échangé depuis plus de 5 jours (petites valeurs très peu liquides) :
+            # dernière clôture journalière sur 3 mois. Un seul téléchargement groupé de plus, pas de repli individuel.
+            if manquants_paquet and (deadline is None or time.monotonic() <= deadline):
+                trouves_longs = telecharger_sans_transaction(manquants_paquet, period="3mo", interval="1d")
+                for ticker, valeur in trouves_longs.items():
+                    resultats[ticker] = lot[ticker] = valeur
+                    sans_transaction.add(ticker)
+                if trouves_longs:
+                    print(f"  💤 {len(trouves_longs)} ticker(s) du paquet {i + 1} sans transaction depuis plus de 5 jours (dernière clôture sur 3 mois conservée).")
+                manquants_paquet = [t for t in manquants_paquet if t not in trouves_longs]
 
         if manquants_paquet:
             print(f"  🔁 {len(manquants_paquet)} ticker(s) du paquet {i + 1} sans donnée -- repli individuel...")
