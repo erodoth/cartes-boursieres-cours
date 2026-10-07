@@ -1,77 +1,60 @@
-# Flux de cours en direct — cartes boursières
+# Chargeur des cours (chargeur_vps)
 
-Récupère toutes les heures le dernier cours connu de chaque société/commodité/
-crypto cotée à cette heure (via Yahoo Finance, `yfinance`), et l'écrit dans
-Supabase (`cours_actuels` + `cours_historique`). Le score se calculant sur la
-performance (variation relative), le prix est stocké tel quel dans sa devise
-de cotation -- pas de conversion USD (précision du 2026-10-01 : la table
-`taux_change` ne sert qu'au calcul de `capitalisation_usd`, un besoin distinct
-déjà traité ailleurs dans le pipeline).
+Programme qui télécharge les derniers cours Yahoo Finance de tous les titres dont la place est ouverte et les écrit dans
+Supabase (`cours_actuels`, `cours_historique`, `cours_echecs`, `journal_chargements_cours`). Les scores horaires du jeu
+(`calculer_scores_horaires`, cron à :00 UTC) se calculent à partir de ces cours.
 
-Ce job doit tourner **en dehors** de la session Claude (qui n'a pas d'accès
-réseau vers Yahoo Finance) et idéalement en dehors de ton ordinateur (pour
-qu'il tourne même ordinateur éteint). La solution retenue : **GitHub Actions**,
-gratuit, avec un cron horaire.
+## Où et quand il tourne
 
-## Mise en place (une seule fois)
+- **Serveur** : OVHcloud VPS-1, Ubuntu 24.04 (`vps-ac008e3c.vps.ovh.net`), code dans `/opt/chargeur`, secrets dans
+  `/etc/chargeur.env` (`DATABASE_URL`), journal `/var/log/chargeur.log`.
+- **Quand** : cron à **:40** de chaque heure (UTC), via `lancer.sh` (`flock` : jamais deux runs en même temps, `timeout` 30 min).
+  Budget de téléchargement : 15 min (`BUDGET_SEC`), le run finit donc avant :55, avant le calcul des scores de :00.
+- **Pourquoi :40** : les scores de l'heure H utilisent le dernier chargement antérieur à H:00. Retard Yahoo observé : US ~0 min,
+  Europe ~15 min, Israël / Thaïlande ~40 min. Avec :40, un joueur qui regarde à :00 voit des cours vieux de 20 à 60 min.
+- **GitHub Actions** (`erodoth/cartes-boursieres-cours`) : plus de lancement automatique, seulement `workflow_dispatch`
+  (secours manuel si l'alerte `chargement_manquant` se déclenche).
+- L'heure du journal est l'heure du lancement (le run de H:40 charge l'heure H). Si l'heure est déjà complète, un run
+  répond « déjà complet » et s'arrête.
 
-1. **Crée un repo GitHub** (public ou privé, peu importe) et pousse-y tout le
-   contenu de ce dossier (`recuperer_cours.py`, `requirements.txt`,
-   `.github/workflows/cours.yml`).
+## Installation / mise à jour
 
-   ```bash
-   cd flux_cours_github
-   git init
-   git add .
-   git commit -m "Flux de cours en direct"
-   git branch -M main
-   git remote add origin https://github.com/<ton-compte>/<ton-repo>.git
-   git push -u origin main
-   ```
+```
+sudo bash installer_chargeur.sh                         # une fois, en root
+scp recuperer_cours.py ubuntu@vps-ac008e3c.vps.ovh.net:~/
+sudo cp ~/recuperer_cours.py /opt/chargeur/recuperer_cours.py     # mise à jour du code
+```
 
-2. **Récupère la chaîne de connexion Postgres de Supabase** :
-   Dashboard Supabase → ton projet (`cartes-boursieres`) → *Project Settings*
-   → *Database* → *Connection string* → onglet **URI** (prends la variante
-   *Session pooler* ou *Transaction pooler*, pas la connexion directe, pour
-   éviter les soucis IPv6 depuis les runners GitHub). Remplace `[YOUR-PASSWORD]`
-   par le vrai mot de passe de la base.
+## Fonctionnement
 
-3. **Ajoute-la comme secret GitHub** : sur la page du repo → *Settings* →
-   *Secrets and variables* → *Actions* → *New repository secret* →
-   nom `DATABASE_URL`, valeur = la chaîne de connexion de l'étape 2.
+1. `recuperer_tickers_ouverts` : tickers des places ouvertes à l'heure (`places.heures_ouvertes_utc`, `jours_ouvres`),
+   commodités et cryptos. Un chargement de **clôture** est fait quand le marché était ouvert à H-1 et ne l'est plus à H.
+2. Téléchargement par paquets de 100 (`yf.download`, 1 jour en bougies de 5 min), **écriture immédiate** après chaque paquet.
+3. Replis en cascade pour les titres sans bougie du jour (comptés comme réussites) :
+   5 jours / 5 min  ->  3 mois / 1 jour (dernière clôture connue, avec sa vraie date)  ->  repli individuel
+   (plafond 60 par run, ignoré pour les tickers chroniques : >= 6 échecs sur 24 h et aucun cours depuis 5 jours).
+4. **Cours d'ouverture** : l'Open de la première bougie du jour est écrit avec le cours (`prix_ouverture`,
+   `horodatage_ouverture`). `calculer_variations_heure` part de l'ouverture quand la fenêtre chevauche l'ouverture de la séance
+   (écart de la nuit / du week-end jamais compté).
+5. Journal : une ligne par run dans `journal_chargements_cours` (attendus, écrits, échecs, complet). Le cron pg_cron
+   `controle_chargement_cours` (:57) crée une alerte `chargement_manquant` s'il manque une heure.
 
-4. **Vérifie que les Actions sont activées** (onglet *Actions* du repo — GitHub
-   les active par défaut). Le job se lance automatiquement toutes les heures à
-   la minute 5. Tu peux aussi le lancer à la main : onglet *Actions* →
-   *Récupération des cours* → *Run workflow*.
+## Points de vigilance
 
-5. **Premier lancement manuel recommandé** pour vérifier que tout fonctionne
-   avant de laisser tourner le cron (regarde les logs dans l'onglet Actions).
+- **Deux sociétés ne doivent jamais avoir le même `ticker_yahoo`** : le programme utilise un dictionnaire par ticker, l'une des
+  deux perdrait son cours en silence.
+- Formats Yahoo par place : suffixe selon la bourse (`.PA`, `.L`, `.KS` / `.KQ` pour la Corée, `.KL` numérique pour la
+  Malaisie, `.MX` sans tiret pour le Mexique, `.CL` pour la Colombie, `.CA` avec code ISIN `EGS…C0xx` pour l'Égypte, `.IR`
+  pour Dublin ; Londres en pence = devise `GBp`).
+- Suppression de sociétés : `begin; delete from exemplaires …; delete from cours_echecs/cours_historique/cours_actuels …;
+  delete from societes …; commit;` (dans l'éditeur SQL Supabase : les DELETE via l'outil MCP expirent). Déplacer ou supprimer
+  d'abord les lignes de `indices_composition`.
+- Pour les joueurs : ne pas annoncer la latence exacte (arbitrage).
 
-## Ce que fait le script à chaque run
+## Commandes utiles (sur le VPS)
 
-- Détermine l'heure UTC courante et le jour de la semaine.
-- Interroge Supabase pour savoir quels tickers sont censés coter à cet instant
-  (sociétés dont la place est ouverte, commodités sauf maintenance CME 21h UTC
-  et week-end, cryptos toujours).
-- Télécharge leur dernier cours via `yfinance`, par paquets de 100 tickers
-  (pause de 4s entre paquets, comme validé dans le script d'origine
-  `analyse_yahoo.py`).
-- Met à jour `cours_actuels` (upsert, un seul cours par carte) et ajoute une
-  ligne dans `cours_historique` (append, pour garder l'historique complet).
-  Le prix est stocké tel quel dans sa devise de cotation (`devise`, à titre
-  informatif) -- pas de conversion USD.
-
-## Limites connues / à surveiller
-
-- **Yahoo Finance est une API non officielle.** Elle peut changer, se mettre à
-  bloquer les IP des runners GitHub, ou devenir instable sans préavis. Si le
-  job échoue soudainement en masse, c'est la première piste à vérifier.
-- **Pas encore de contrôle d'anomalie à 25%** (prévu par les règles v5 mais
-  non implémenté ici) : un cours Yahoo aberrant serait pris tel quel. À ajouter
-  si besoin (ex. rejeter un nouveau cours qui varie de plus de 25% par rapport
-  au précédent `cours_actuels`, et logguer l'anomalie au lieu de l'écrire).
-- **RLS toujours désactivé** sur les tables Supabase (signalé précédemment) --
-  ce script utilise la connexion Postgres directe (pas la clé `anon`), donc il
-  n'est pas concerné, mais le site public le sera : à traiter avant mise en
-  ligne.
+```
+tail -n 50 /var/log/chargeur.log
+cat /etc/cron.d/chargeur
+sudo /opt/chargeur/lancer.sh        # lancement manuel
+```
