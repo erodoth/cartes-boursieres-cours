@@ -54,7 +54,12 @@ import psycopg2.extras
 import yfinance as yf
 
 TAILLE_PAQUET = 100
-PAUSE_ENTRE_PAQUETS_SEC = 4.0
+# 2026-10-08 : pause entre deux paquets réglable sans toucher au code (variable PAUSE_PAQUETS_SEC dans /etc/chargeur.env).
+# Défaut 2 s (était 4 s). Retour arrière : PAUSE_PAQUETS_SEC=4
+try:
+    PAUSE_ENTRE_PAQUETS_SEC = max(0.0, float(os.environ.get("PAUSE_PAQUETS_SEC", "2.0")))
+except ValueError:
+    PAUSE_ENTRE_PAQUETS_SEC = 2.0
 HEURE_MAINTENANCE_COMMODITIES = 21  # pause quotidienne CME Globex, 21h-22h UTC
 JOURS_FR = ["lun", "mar", "mer", "jeu", "ven", "sam", "dim"]
 
@@ -363,6 +368,8 @@ def telecharger_derniers_prix(liste_tickers, deadline=None, chroniques=frozenset
     non_traites = []   # tickers laissés de côté faute de temps
     sans_transaction = set()
     nb_replis = 0
+    t_debut_paquets = time.monotonic()
+    pause_cumulee = 0.0
     paquets = [liste_tickers[i:i + TAILLE_PAQUET] for i in range(0, len(liste_tickers), TAILLE_PAQUET)]
     print(f"📦 {len(liste_tickers)} tickers à jour, {len(paquets)} paquet(s) de {TAILLE_PAQUET} max.")
 
@@ -473,7 +480,11 @@ def telecharger_derniers_prix(liste_tickers, deadline=None, chroniques=frozenset
 
         if i + 1 < len(paquets):
             time.sleep(PAUSE_ENTRE_PAQUETS_SEC)
+            pause_cumulee += PAUSE_ENTRE_PAQUETS_SEC
 
+    duree = time.monotonic() - t_debut_paquets
+    print(f"⏱️  Téléchargement : {duree:.0f} s pour {len(paquets)} paquet(s), dont {pause_cumulee:.0f} s de pause "
+          f"(pause = {PAUSE_ENTRE_PAQUETS_SEC:g} s) ; {len(echecs_detail)} échec(s), {len(non_traites)} non traité(s).")
     return resultats, echecs_detail, non_traites, sans_transaction
 
 
